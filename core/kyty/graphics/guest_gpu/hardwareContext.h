@@ -583,6 +583,8 @@ struct ComputeShaderInfo {
 	UserSgprInfo     cs_user_sgpr;
 };
 
+bool ApplyComputeShaderRegister(CsStageRegisters& cs_regs, uint32_t offset, uint32_t value);
+
 struct GeControl {
 	uint16_t primitive_group_size = 0;
 	uint16_t vertex_group_size    = 0;

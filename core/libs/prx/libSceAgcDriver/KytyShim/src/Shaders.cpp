@@ -32,6 +32,11 @@ static_assert(offsetof(ShaderUserData, direct_resource_count) == offsetof(Kyty::
 static_assert(offsetof(ShaderUserData, sharp_resource_count) == offsetof(Kyty::ShaderUserData, sharp_resource_count));
 static_assert(sizeof(ShaderSemantic) == sizeof(Kyty::ShaderSemantic));
 static_assert(sizeof(ShaderSharp) == sizeof(Kyty::ShaderSharp));
+static_assert(sizeof(ShaderRegister) == sizeof(Kyty::ShaderRegister));
+static_assert(sizeof(ShaderSpecialRegs) == sizeof(Kyty::ShaderSpecialRegs));
+static_assert(offsetof(ShaderSpecialRegs, dispatch_modifier) == offsetof(Kyty::ShaderSpecialRegs, dispatch_modifier));
+static_assert(offsetof(Shader, sh_registers) == offsetof(Kyty::Shader, sh_registers));
+static_assert(offsetof(Shader, specials) == offsetof(Kyty::Shader, specials));
 
 struct ShaderMap {
     ShaderMap() { Kyty::ShaderInit(); }
@@ -58,6 +63,10 @@ extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader) {
     map.num_input_semantics = shader->num_input_semantics;
     map.code_size_bytes = shader->shader_size;
     map.scratch_size_dwords = shader->scratch_size_dw_per_thread;
+    if (!replay && map.type == Kyty::Prospero::ShaderBinaryType::kCs && shader->sh_registers != nullptr && shader->specials != nullptr) {
+        map.sh_registers = {reinterpret_cast<const Kyty::ShaderRegister*>(shader->sh_registers), shader->num_sh_registers};
+        map.specials = reinterpret_cast<const Kyty::ShaderSpecialRegs*>(shader->specials);
+    }
     Kyty::ShaderMapUserData(reinterpret_cast<std::uint64_t>(shader->code), map);
 }
 

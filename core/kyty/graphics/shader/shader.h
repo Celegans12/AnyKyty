@@ -365,6 +365,8 @@ struct ShaderMappedData {
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
 	uint32_t        scratch_size_dwords = 0;
+	std::span<const ShaderRegister> sh_registers;
+	const ShaderSpecialRegs*        specials = nullptr;
 };
 
 void ShaderInit();
@@ -383,6 +385,8 @@ uint32_t ShaderPixelPackedBlendSlots(const ShaderPixelInputInfo& info);
 
 using ShaderMapListener = void (*)(void* userdata, uint64_t hash, std::span<const uint32_t> code);
 void ShaderSetMapListener(ShaderMapListener listener, void* userdata);
+using ShaderComputeListener = void (*)(void* userdata, uint64_t addr);
+void ShaderSetComputeListener(ShaderComputeListener listener, void* userdata);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

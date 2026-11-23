@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -44,6 +45,9 @@ struct ShaderMapData: ShaderMappedData {
 	ShaderVertexMetadata vertex;
 	const char*          vertex_error = nullptr;
 	uint32_t binary_size_bytes = 0;
+	HW::CsStageRegisters compute;
+	uint32_t             dispatch_modifier = 0;
+	bool                 compute_known     = false;
 };
 
 struct ShaderMapEntry {
@@ -57,6 +61,8 @@ static std::atomic<uint64_t> g_shader_map_generation {0};
 static std::mutex        g_shader_listener_mutex;
 static ShaderMapListener g_shader_listener          = nullptr;
 static void*             g_shader_listener_userdata = nullptr;
+static ShaderComputeListener g_compute_listener          = nullptr;
+static void*                 g_compute_listener_userdata = nullptr;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -90,6 +96,24 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
+	if (data.type == Prospero::ShaderBinaryType::kCs && data.specials != nullptr && !data.sh_registers.empty()) {
+		constexpr uint32_t Needed[] = {Pm4::COMPUTE_PGM_LO,       Pm4::COMPUTE_PGM_HI,       Pm4::COMPUTE_PGM_RSRC1,
+		                               Pm4::COMPUTE_PGM_RSRC2,    Pm4::COMPUTE_NUM_THREAD_X, Pm4::COMPUTE_NUM_THREAD_Y,
+		                               Pm4::COMPUTE_NUM_THREAD_Z};
+		uint32_t seen  = 0;
+		bool     known = true;
+		for (const auto& reg: data.sh_registers) {
+			known = known && HW::ApplyComputeShaderRegister(mapped.compute, reg.offset, reg.value);
+			for (uint32_t i = 0; i < std::size(Needed); i++) {
+				seen |= reg.offset == Needed[i] ? 1u << i : 0u;
+			}
+		}
+		mapped.dispatch_modifier = data.specials->dispatch_modifier;
+		mapped.compute.wave_size = Pm4::ComputeWaveSize(mapped.dispatch_modifier);
+		mapped.compute_known     = known && seen == (1u << std::size(Needed)) - 1u && mapped.compute.data_addr == addr;
+	}
+	mapped.sh_registers = {};
+	mapped.specials     = nullptr;
 	{
 		std::scoped_lock lock(g_shader_map_mutex);
 		(*g_shader_map)[addr] = {mapped, hash};
@@ -99,6 +123,9 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	if (g_shader_listener != nullptr) {
 		g_shader_listener(g_shader_listener_userdata, hash,
 		                  std::span(binary, mapped.code_size_bytes / sizeof(uint32_t)));
+	}
+	if (g_compute_listener != nullptr && mapped.compute_known) {
+		g_compute_listener(g_compute_listener_userdata, addr);
 	}
 }
 
@@ -125,6 +152,27 @@ void ShaderSetMapListener(ShaderMapListener listener, void* userdata) {
 		listener(userdata, entry.hash,
 		         std::span(reinterpret_cast<const uint32_t*>(addr),
 		                   entry.data.code_size_bytes / sizeof(uint32_t)));
+	}
+}
+
+void ShaderSetComputeListener(ShaderComputeListener listener, void* userdata) {
+	std::scoped_lock listener_lock(g_shader_listener_mutex);
+	g_compute_listener          = listener;
+	g_compute_listener_userdata = userdata;
+	if (listener == nullptr || g_shader_map == nullptr) {
+		return;
+	}
+	std::vector<uint64_t> known;
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		for (const auto& [addr, entry]: *g_shader_map) {
+			if (entry.data.compute_known) {
+				known.push_back(addr);
+			}
+		}
+	}
+	for (const auto addr: known) {
+		listener(userdata, addr);
 	}
 }
 
@@ -843,6 +891,23 @@ ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInpu
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
+}
+
+bool PrepareRegisteredProgram(uint64_t addr, ShaderParams& params, ShaderComputeInputInfo& info) {
+	HW::ComputeShaderInfo regs {};
+	uint32_t              modifier = 0;
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		const auto       found = g_shader_map->find(addr);
+		if (found == g_shader_map->end() || !found->second.data.compute_known) {
+			return false;
+		}
+		regs.cs_regs = found->second.data.compute;
+		modifier     = found->second.data.dispatch_modifier;
+	}
+	params                          = PrepareProgram(regs, info);
+	info.dispatch_thread_dimensions = (modifier & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	return true;
 }
 
 void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info) {

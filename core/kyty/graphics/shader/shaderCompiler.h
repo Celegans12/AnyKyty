@@ -40,6 +40,7 @@ ShaderParams PrepareProgram(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               input_info);
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
+bool         PrepareRegisteredProgram(uint64_t addr, ShaderParams& params, ShaderComputeInputInfo& input_info);
 
 using ShaderGuestReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
 

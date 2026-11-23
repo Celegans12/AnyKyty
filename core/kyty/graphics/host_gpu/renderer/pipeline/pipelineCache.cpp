@@ -1870,11 +1870,20 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 	options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
 	options.wave_lane_pairs    = m_lane_pairs;
+#if defined(ANYPS5_KYTY)
+	auto registered = TakeRegisteredTranslation(m_lookup_key);
+#endif
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
 		                                    ShaderRecompiler::StageName(options.stage), params.hash));
+#if defined(ANYPS5_KYTY)
+		if (registered == nullptr) {
+			source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		}
+#else
 		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+#endif
 		if (source.unsupported_call_pc != UINT32_MAX && !source.expand_calls) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
@@ -1885,6 +1894,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	auto* current = entry == m_program_cache.end() ? &source : entry->second.call_source.get();
 	ShaderRecompiler::TranslateResult translated;
+#if defined(ANYPS5_KYTY)
+	if (registered != nullptr) {
+		translated = std::move(*registered);
+	} else
+#endif
 	if (current != nullptr) {
 		if (current->HasCalls()) {
 			if (entry == m_program_cache.end()) {
@@ -1989,6 +2003,11 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		m_workers.emplace_back([this] { CompileWorker(); });
 	}
 #if defined(ANYPS5_KYTY)
+	if (TranslatesAtRegistration()) {
+		ShaderSetComputeListener(OnComputeRegistered, this);
+	}
+#endif
+#if defined(ANYPS5_KYTY)
 	if (m_libraries != nullptr) {
 		const auto& chain = PipelineChainThreads();
 		for (uint32_t i = 0; i < chain.threads; i++) {
@@ -2014,6 +2033,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 PipelineCache::~PipelineCache() {
 	m_precompile = {};
 #if defined(ANYPS5_KYTY)
+	ShaderSetComputeListener(nullptr, nullptr);
 	StopChains();
 #endif
 	StopWorkers();
@@ -3022,11 +3042,24 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 		options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
 		options.wave_lane_pairs    = job.lane_pairs;
+#if defined(ANYPS5_KYTY)
+		ShaderRecompiler::TranslateResult translated;
+		if (auto registered = TakeRegisteredTranslation(job.key); registered != nullptr) {
+			translated = std::move(*registered);
+		} else {
+			auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
+			if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
+				return;
+			}
+			translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		}
+#else
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			return;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+#endif
 		plan            = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		auto specialization = job.specialization;
 		if (!specialization) {
@@ -3120,10 +3153,32 @@ void PipelineCache::CompileWorker() {
 		std::unique_ptr<CompileJob> job;
 		{
 			std::unique_lock lock(m_job_mutex);
+#if defined(ANYPS5_KYTY)
+			m_job_available.wait(lock, [&] {
+				return m_stopping || !m_jobs.empty() ||
+				       (!m_registered_jobs.empty() && m_registered_running < RegisteredWorkers);
+			});
+			if (m_stopping) {
+				return;
+			}
+			if (m_jobs.empty()) {
+				const auto registered = m_registered_jobs.front();
+				m_registered_jobs.pop_front();
+				m_registered_running++;
+				lock.unlock();
+				RunRegisteredJob(registered);
+				lock.lock();
+				m_registered_running--;
+				lock.unlock();
+				m_job_available.notify_one();
+				continue;
+			}
+#else
 			m_job_available.wait(lock, [&] { return m_stopping || !m_jobs.empty(); });
 			if (m_stopping) {
 				return;
 			}
+#endif
 			job = std::move(m_jobs.front());
 			m_jobs.pop_front();
 		}
@@ -3153,6 +3208,126 @@ void PipelineCache::StopWorkers() {
 	m_job_available.notify_all();
 	m_workers.clear();
 }
+
+#if defined(ANYPS5_KYTY)
+struct PipelineCache::RegisteredProgram {
+	std::vector<uint32_t>  code;
+	ShaderParams           params;
+	ShaderComputeInputInfo input_info {};
+};
+
+bool PipelineCache::TranslatesAtRegistration() {
+	return Common::Fallback::Containable();
+}
+
+PipelineCache::RegisteredOutcome PipelineCache::TranslateRegistered(
+    const ShaderParams& params, const ShaderComputeInputInfo& input_info,
+    std::unique_ptr<ShaderRecompiler::TranslateResult>& translated) {
+	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
+	options.stage              = ShaderType::Compute;
+	options.input_info.compute = &input_info;
+	options.shader_hash        = params.hash;
+	options.user_data          = std::span(params.user_data).first(params.user_data_count);
+	options.back_code          = params.back_code;
+	options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
+	options.native_ray_tracing = RayTracing::NativeTraversals();
+	options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
+	options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
+	bool       calls = false;
+	const bool done  = Common::Fallback::Run(
+        "compute translation at registration dropped: the shader recompiler stopped",
+        "PipelineCache::TranslateRegistered", params.hash, 0, true, [&] {
+            auto source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+            calls       = source.HasCalls() || source.unsupported_call_pc != UINT32_MAX;
+            if (!calls) {
+                translated = std::make_unique<ShaderRecompiler::TranslateResult>(
+                    ShaderRecompiler::TranslateProgram(source.decoded, options));
+            }
+        });
+	if (!done) {
+		translated.reset();
+		return RegisteredOutcome::Stopped;
+	}
+	return calls ? RegisteredOutcome::Calls : RegisteredOutcome::Translated;
+}
+
+void PipelineCache::OnComputeRegistered(void* userdata, uint64_t addr) {
+	auto&                  cache = *static_cast<PipelineCache*>(userdata);
+	ShaderParams           params;
+	ShaderComputeInputInfo input_info {};
+	if (!PrepareRegisteredProgram(addr, params, input_info) || params.code.size() < RegisteredMinWords) {
+		return;
+	}
+	auto program  = std::make_shared<RegisteredProgram>();
+	program->code.assign(params.code.begin(), params.code.end());
+	program->params      = params;
+	program->params.code = program->code;
+	input_info.host_subgroup_size = cache.m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	input_info.lds_storage        = input_info.lds_size_dwords * 4u >
+	                         cache.m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	program->input_info = input_info;
+	{
+		std::lock_guard lock(cache.m_job_mutex);
+		cache.m_registered_jobs.push_back({.program = std::move(program)});
+	}
+	cache.m_job_available.notify_one();
+}
+
+void PipelineCache::RunRegisteredJob(const RegisteredJob& job) {
+	const auto& params = job.program->params;
+	for (const bool async: {false, true}) {
+		if (job.async >= 0 && async != (job.async != 0)) {
+			continue;
+		}
+		auto input_info          = job.program->input_info;
+		input_info.async_compute = async;
+		ProgramKey key {.stage = ShaderType::Compute, .hash = params.hash, .user_data_count = params.user_data_count};
+		BuildStageStaticKey(input_info, key.static_state);
+		AppendNativeRayTracingKey(ShaderType::Compute, key.static_state, true);
+		{
+			std::lock_guard lock(m_registered_mutex);
+			if (m_registered.contains(key)) {
+				continue;
+			}
+		}
+		if (job.async < 0) {
+			LockPrograms();
+			const bool known = m_program_cache.contains(key) || m_in_flight.contains(key);
+			UnlockPrograms();
+			if (known) {
+				continue;
+			}
+		}
+		std::unique_ptr<ShaderRecompiler::TranslateResult> translated;
+		if (TranslateRegistered(params, input_info, translated) != RegisteredOutcome::Translated) {
+			return;
+		}
+		std::lock_guard lock(m_registered_mutex);
+		m_registered.try_emplace(key, RegisteredTranslation {.translated = std::move(translated),
+		                                                     .program    = job.program,
+		                                                     .async      = async});
+	}
+}
+
+std::unique_ptr<ShaderRecompiler::TranslateResult> PipelineCache::TakeRegisteredTranslation(const ProgramKey& key) {
+	RegisteredTranslation taken;
+	{
+		std::lock_guard lock(m_registered_mutex);
+		auto            node = m_registered.extract(key);
+		if (node.empty()) {
+			return nullptr;
+		}
+		taken = std::move(node.mapped());
+	}
+	{
+		std::lock_guard lock(m_job_mutex);
+		m_registered_jobs.push_back({.program = std::move(taken.program), .async = taken.async ? 1 : 0});
+	}
+	m_job_available.notify_one();
+	return std::move(taken.translated);
+}
+#endif
 
 #if defined(ANYPS5_KYTY)
 void PipelineCache::QueueChain(std::unique_ptr<ChainJob>&& job) {

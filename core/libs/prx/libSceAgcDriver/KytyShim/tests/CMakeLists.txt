@@ -427,6 +427,14 @@ set_tests_properties(kyty_shim_merged_hull PROPERTIES TIMEOUT 20 PASS_REGULAR_EX
 add_test(NAME kyty_shim_merged_hull_draw COMMAND kyty_shim_merged_hull_tests draw)
 set_tests_properties(kyty_shim_merged_hull_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 
+target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ComputeRegistration.cpp)
+add_test_executable(kyty_shim_compute_registration_tests ${CMAKE_CURRENT_SOURCE_DIR}/ComputeRegistrationMain.cpp)
+configure_host_test_executable(kyty_shim_compute_registration_tests)
+target_link_libraries(kyty_shim_compute_registration_tests PRIVATE libSceAgcDriver libkernel libc)
+add_test(NAME kyty_shim_compute_registration COMMAND kyty_shim_compute_registration_tests)
+set_tests_properties(kyty_shim_compute_registration PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_compute_registration: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 if(NOT ANYPS5_KYTY_DLL)
     add_test_executable(kyty_shim_recompiler_robustness_tests ${CMAKE_CURRENT_SOURCE_DIR}/RecompilerRobustness.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_recompiler_robustness_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../fuzz)

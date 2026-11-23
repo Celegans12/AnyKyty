@@ -454,6 +454,12 @@ public:
 	bool GetGraphicsProgramsAhead(const HW::Context& context, const HW::UserConfig& user_config,
 	                              const HW::Shader& shaders, DrawRenderState& state,
 	                              ProgramResolution& ahead);
+#if defined(ANYPS5_KYTY)
+	enum class RegisteredOutcome : uint8_t { Translated, Calls, Stopped };
+	static bool              TranslatesAtRegistration();
+	static RegisteredOutcome TranslateRegistered(const ShaderParams& params, const ShaderComputeInputInfo& input_info,
+	                                             std::unique_ptr<ShaderRecompiler::TranslateResult>& translated);
+#endif
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info,
 	                                      bool                         guest_traversal = false);
@@ -632,6 +638,27 @@ private:
 	std::deque<std::unique_ptr<CompileJob>>                  m_jobs;
 	bool                                                     m_stopping = false;
 	std::vector<std::jthread>                                m_workers;
+#if defined(ANYPS5_KYTY)
+	struct RegisteredProgram;
+	struct RegisteredJob {
+		std::shared_ptr<const RegisteredProgram> program;
+		int                                      async = -1;
+	};
+	struct RegisteredTranslation {
+		std::unique_ptr<ShaderRecompiler::TranslateResult> translated;
+		std::shared_ptr<const RegisteredProgram>           program;
+		bool                                               async = false;
+	};
+	static constexpr uint32_t RegisteredWorkers  = 2;
+	static constexpr uint32_t RegisteredMinWords = 4096;
+	std::deque<RegisteredJob> m_registered_jobs;
+	uint32_t                  m_registered_running = 0;
+	std::mutex                m_registered_mutex;
+	std::unordered_map<ProgramKey, RegisteredTranslation, ProgramKeyHash> m_registered;
+	static void OnComputeRegistered(void* userdata, uint64_t addr);
+	void        RunRegisteredJob(const RegisteredJob& job);
+	std::unique_ptr<ShaderRecompiler::TranslateResult> TakeRegisteredTranslation(const ProgramKey& key);
+#endif
 
 	ShaderStoreWriter m_store;
 	std::jthread      m_driver_cache_timer;
